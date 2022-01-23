@@ -11,7 +11,7 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
-	"github.com/simonswine/thames-water-importer/app"
+	"github.com/simonswine/glowmarkt-importer/app"
 	"github.com/urfave/cli/v2"
 )
 
@@ -24,10 +24,16 @@ func main() {
 		)
 	)
 
+	level.AllowInfo()
+
 	cliApp := &cli.App{
-		Name:  "thames-water-importer",
+		Name:  "glowmarkt-importer",
 		Usage: "Export Thames Water Smartmeter consumption data and ingest into Thanos",
 		Action: func(c *cli.Context) error {
+
+			if !c.Bool("verbose") {
+				logger = level.NewFilter(logger, level.AllowInfo())
+			}
 
 			var externalLabels []string
 			for _, lbl := range c.StringSlice("external-labels") {
@@ -40,12 +46,10 @@ func main() {
 
 			a := app.New(
 				app.WithLogger(logger),
-				app.WithThamesWaterLogin(c.String("thames-water-email"), c.String("thames-water-password")),
-				app.WithThamesWaterLoginTimeout(c.Duration("thames-water-login-timeout")),
-				app.WithChromeHeadless(c.Bool("chrome-headless")),
-				app.WithChromeSandbox(c.Bool("chrome-sandbox")),
+				app.WithGlowmarktLogin(c.String("glowmarkt-email"), c.String("glowmarkt-password")),
 				app.WithTSDBPath(c.String("tsdb-path")),
-				app.WithTSDBBlockDuration(c.Duration("tsdb-block-duration")),
+				app.WithTSDBBlockLength(c.Duration("tsdb-block-length")),
+				app.WithTSDBRetention(c.Duration("tsdb-retention")),
 				app.WithExternalLabels(externalLabels...),
 				app.WithThanosBucketObj(c.String("thanos-bucket-obj")),
 			)
@@ -54,21 +58,26 @@ func main() {
 			return a.Run(ctx)
 		},
 		Flags: []cli.Flag{
+			&cli.BoolFlag{
+				Name:    "verbose",
+				Aliases: []string{"v"},
+				Usage:   "Enable debug logging",
+			},
 			&cli.StringFlag{
-				Name:     "thames-water-email",
+				Name:     "glowmarkt-email",
 				Usage:    "Thames Water online account email address.",
-				EnvVars:  []string{"THAMES_WATER_EMAIL"},
+				EnvVars:  []string{"GLOWMARKT_EMAIL"},
 				Required: true,
 			},
 			&cli.DurationFlag{
-				Name:  "thames-water-login-timeout",
+				Name:  "glowmarkt-login-timeout",
 				Usage: "Configure the TSDB block length. Only change if you know what you are doing.",
 				Value: 10 * time.Second,
 			},
 			&cli.StringFlag{
-				Name:        "thames-water-password",
+				Name:        "glowmarkt-password",
 				Usage:       "Thames Water online account password.",
-				EnvVars:     []string{"THAMES_WATER_PASSWORD"},
+				EnvVars:     []string{"GLOWMARKT_PASSWORD"},
 				Required:    true,
 				DefaultText: "none",
 			},
@@ -81,6 +90,12 @@ func main() {
 				Name:  "tsdb-block-length",
 				Usage: "Configure the TSDB block length. Only change if you know what you are doing.",
 				Value: 2 * time.Hour,
+			},
+			&cli.DurationFlag{
+				Name:        "tsdb-retention",
+				Usage:       "How many blocks to keep.",
+				Value:       365 * 24 * time.Hour,
+				DefaultText: "365*24h=8760h",
 			},
 			&cli.BoolFlag{
 				Name:  "chrome-sandbox",
@@ -95,7 +110,7 @@ func main() {
 			&cli.StringSliceFlag{
 				Name:  "external-labels",
 				Usage: "External labels are added to the metrics in each block to identify them",
-				Value: cli.NewStringSlice("cluster=thames-water-importer"),
+				Value: cli.NewStringSlice("cluster=glowmarkt-importer"),
 			},
 			&cli.StringFlag{
 				Name:        "thanos-bucket-obj",

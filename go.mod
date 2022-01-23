@@ -1,4 +1,4 @@
-module github.com/simonswine/thames-water-importer
+module github.com/simonswine/glowmarkt-importer
 
 go 1.17
 

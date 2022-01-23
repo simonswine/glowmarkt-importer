@@ -3,43 +3,50 @@ package app
 import (
 	"context"
 	"fmt"
-	"net/http"
-	"sort"
-	"strconv"
+	"math"
 	"strings"
 	"time"
 
-	retry "github.com/avast/retry-go/v4"
-	"github.com/chromedp/cdproto/network"
-	"github.com/chromedp/chromedp"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/grafana/dskit/runutil"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/timestamp"
+	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/objstore/client"
 	"github.com/thanos-io/thanos/pkg/shipper"
 
-	"github.com/simonswine/thames-water-importer/api"
+	"github.com/simonswine/glowmarkt-importer/api"
 )
 
-const (
-	loginURL = "https://myaccount.thameswater.co.uk/login"
-)
+type logLevelOverride struct {
+	next  log.Logger
+	level interface{}
+}
+
+func (l *logLevelOverride) Log(keyvals ...interface{}) error {
+	for i := 0; i < len(keyvals); i += 2 {
+		if n, ok := keyvals[0].(string); ok && n == "level" {
+			keyvals[i+1] = l.level
+			return l.next.Log(keyvals...)
+		}
+	}
+	kvs := make([]interface{}, len(keyvals)+2)
+	kvs[0], kvs[1] = level.Key(), l.level
+	copy(kvs[2:], keyvals)
+	return l.next.Log(kvs...)
+}
 
 type config struct {
-	thamesWaterEmail        string
-	thamesWaterPassword     string
-	thamesWaterLoginTimeout time.Duration
+	glowmarktEmail    string
+	glowmarktPassword string
 
-	chromeHeadless bool
-	chromeSandbox  bool
-
-	tsdbPath          string
-	tsdbBlockDuration time.Duration
+	tsdbPath        string
+	tsdbBlockLength time.Duration
+	tsdbRetention   time.Duration
 
 	externalLabels func() labels.Labels
 
@@ -49,14 +56,12 @@ type config struct {
 func defaultConfig() *config {
 	return &config{
 		externalLabels: func() labels.Labels {
-			return labels.FromStrings("cluster", "thames-water-importer")
+			return labels.FromStrings("cluster", "glowmarkt-importer")
 		},
 
-		chromeSandbox:  true,
-		chromeHeadless: true,
-
-		tsdbPath:          "./tsdb",
-		tsdbBlockDuration: 2 * time.Hour,
+		tsdbPath:        "./tsdb",
+		tsdbBlockLength: 2 * time.Hour,
+		tsdbRetention:   365 * 24 * time.Hour,
 	}
 }
 
@@ -74,27 +79,10 @@ func WithLogger(l log.Logger) NewOption {
 	}
 }
 
-func WithThamesWaterLogin(email, password string) NewOption {
+func WithGlowmarktLogin(email, password string) NewOption {
 	return func(a *App) {
-		a.cfg.thamesWaterEmail = email
-		a.cfg.thamesWaterPassword = password
-	}
-}
-
-func WithThamesWaterLoginTimeout(d time.Duration) NewOption {
-	return func(a *App) {
-		a.cfg.thamesWaterLoginTimeout = d
-	}
-}
-
-func WithChromeHeadless(b bool) NewOption {
-	return func(a *App) {
-		a.cfg.chromeHeadless = b
-	}
-}
-func WithChromeSandbox(b bool) NewOption {
-	return func(a *App) {
-		a.cfg.chromeSandbox = b
+		a.cfg.glowmarktEmail = email
+		a.cfg.glowmarktPassword = password
 	}
 }
 
@@ -104,9 +92,15 @@ func WithTSDBPath(s string) NewOption {
 	}
 }
 
-func WithTSDBBlockDuration(d time.Duration) NewOption {
+func WithTSDBBlockLength(d time.Duration) NewOption {
 	return func(a *App) {
-		a.cfg.tsdbBlockDuration = d
+		a.cfg.tsdbBlockLength = d
+	}
+}
+
+func WithTSDBRetention(d time.Duration) NewOption {
+	return func(a *App) {
+		a.cfg.tsdbRetention = d
 	}
 }
 
@@ -175,210 +169,238 @@ func (a *App) uploadLocalTSDB(ctx context.Context) error {
 	return nil
 }
 
-func (a *App) getLoginCookies(ctx context.Context) ([]*http.Cookie, error) {
-	opts := chromedp.DefaultExecAllocatorOptions[:]
-
-	if !a.cfg.chromeSandbox {
-		opts = append(opts, chromedp.NoSandbox)
-	}
-
-	if !a.cfg.chromeHeadless {
-		opts = append(opts, chromedp.Flag("headless", false))
-	}
-
-	allocCtx, _ := chromedp.NewExecAllocator(ctx, opts...)
-
-	// create context
-	chromeCtx, cancel := chromedp.NewContext(
-		allocCtx,
+func (app *App) newResource(ctx context.Context, c *api.Client, ar *api.Resource, q storage.Querier) (*resource, error) {
+	var (
+		metricName          = strings.ReplaceAll(strings.ToLower(ar.Name), " ", "_") + "_kwh"
+		resourceIDLabelName = "resource_id"
 	)
-	defer cancel()
+	lbls := labels.NewBuilder(app.cfg.externalLabels())
+	lbls.Set("job", "glowmarkt-importer")
+	lbls.Set(labels.MetricName, strings.ReplaceAll(strings.ToLower(ar.Name), " ", "_")+"_kwh")
+	lbls.Set(resourceIDLabelName, ar.ResourceID)
 
-	var accountNumber, accountAddress string
-	var twCookies []*http.Cookie
-
-	// login to thames water
-	_ = level.Info(a.logger).Log("msg", "attempting login to thames water account", "email", a.cfg.thamesWaterEmail)
-	if err := chromedp.Run(chromeCtx,
-		loginThamesWater(a.cfg.thamesWaterEmail, a.cfg.thamesWaterPassword, &accountNumber, &accountAddress),
-		chromedp.ActionFunc(func(ctx context.Context) error {
-			cookies, err := network.GetAllCookies().Do(ctx)
-			if err != nil {
-				return err
-			}
-
-			for _, cookie := range cookies {
-				if strings.HasSuffix(cookie.Domain, ".thameswater.co.uk") && (cookie.Name == "JSESSIONID" || cookie.Name == "da_sid" || cookie.Name == "da_lid" || cookie.Name == "ARRAffinity" || cookie.Name == "ARRAffinitySameSite") {
-					twCookies = append(twCookies, &http.Cookie{
-						Name:  cookie.Name,
-						Value: cookie.Value,
-
-						Path:   cookie.Path,
-						Domain: cookie.Domain,
-						Expires: func() time.Time {
-							if cookie.Expires < 0 {
-								return time.Time{}
-							}
-							return time.Unix(int64(cookie.Expires), 0)
-						}(),
-						Secure: cookie.Secure,
-						SameSite: func() http.SameSite {
-							switch cookie.SameSite {
-							case network.CookieSameSiteLax:
-								return http.SameSiteLaxMode
-							case network.CookieSameSiteStrict:
-								return http.SameSiteStrictMode
-							case network.CookieSameSiteNone:
-								return http.SameSiteNoneMode
-							}
-							return http.SameSiteDefaultMode
-						}(),
-					})
-				}
-			}
-
-			return nil
-		}),
-	); err != nil {
-		return nil, err
+	r := &resource{
+		c:      c,
+		id:     ar.ResourceID,
+		lbls:   lbls.Labels(),
+		logger: app.logger,
 	}
-	_ = level.Info(a.logger).Log("msg", "successfully logged in", "accountNumber", accountNumber, "accountAddress", accountAddress)
 
-	return twCookies, nil
+	// find the latest reading
+	result := q.Select(
+		true,
+		nil,
+		labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, metricName),
+		labels.MustNewMatcher(labels.MatchEqual, resourceIDLabelName, ar.ResourceID),
+	)
+
+	for result.Next() {
+		s := result.At().Iterator()
+		var ts int64
+		var value float64
+		for s.Next() {
+			ts, value = s.At()
+		}
+		r.minTime = timestamp.Time(ts).Add(api.ResourceReadingDuration).Add(-time.Second)
+		r.value = value
+
+		_ = level.Debug(r.logger).Log("msg", "found existing reading, start from there", "name", r.lbls.Get(labels.MetricName), "reading_time", timestamp.Time(ts), "value", value)
+	}
+
+	return r, r.next(ctx)
+}
+
+type resource struct {
+	c      *api.Client
+	id     string
+	logger log.Logger
+
+	ref  storage.SeriesRef
+	lbls labels.Labels
+
+	minTime time.Time
+	maxTime time.Time
+
+	readings []api.ResourceReading
+	pos      int
+	value    float64
+	finished bool
+}
+
+func (r *resource) at() time.Time {
+	return r.readings[r.pos].Time
+}
+
+func (r *resource) append(ctx context.Context, a storage.Appender) error {
+	var err error
+
+	_ = level.Debug(r.logger).Log("msg", "add reading", "name", r.lbls.Get(labels.MetricName), "reading_time", r.at(), "value", r.value)
+	r.ref, err = a.Append(r.ref, r.lbls, timestamp.FromTime(r.at()), r.value)
+	if err != nil {
+		return err
+	}
+	return r.next(ctx)
+}
+
+// make next value available
+func (r *resource) next(ctx context.Context) error {
+	// return early if data is available
+	if len(r.readings) > r.pos+1 {
+		r.pos += 1
+		r.value += r.readings[r.pos].Value
+		return nil
+	}
+
+	// check if minTime is set
+	if r.minTime.IsZero() {
+		t, err := r.c.GetResourceFirstTime(ctx, r.id)
+		if err != nil {
+			return err
+		}
+		r.minTime = t
+	}
+
+	// check if maxTime is set
+	if r.maxTime.IsZero() {
+		t, err := r.c.GetResourceLastTime(ctx, r.id)
+		if err != nil {
+			return err
+		}
+		r.maxTime = t
+	}
+
+	// check if the time span is bigger than max duration
+	to := r.maxTime
+	if to.Sub(r.minTime) > api.ResourceReadingMaxDuration {
+		to = r.minTime.Add(api.ResourceReadingMaxDuration)
+	}
+
+	// check if we are finished here
+	if to.Before(r.minTime) {
+		r.finished = true
+		return nil
+	}
+
+	// check readings
+	readings, err := r.c.GetResourceReadings(ctx, r.id, r.minTime, to)
+	if err != nil {
+		return err
+	}
+	r.readings = readings.Data
+	r.pos = 0
+
+	if len(readings.Data) == 0 {
+		r.finished = true
+		return nil
+	}
+	r.value += r.readings[r.pos].Value
+	r.minTime = to.Add(api.ResourceReadingDuration)
+
+	return nil
 }
 
 func (a *App) importConsumptionIntoLocalTSDB(ctx context.Context) error {
 	// open tsdb
 	options := tsdb.DefaultOptions()
-	options.RetentionDuration = 90 * 24 * time.Hour.Milliseconds()
+	options.RetentionDuration = a.cfg.tsdbRetention.Milliseconds()
 
 	// set retention
-	options.MinBlockDuration = a.cfg.tsdbBlockDuration.Milliseconds()
-	options.MaxBlockDuration = a.cfg.tsdbBlockDuration.Milliseconds()
 
-	db, err := tsdb.Open(a.cfg.tsdbPath, level.Debug(a.logger), a.reg, options, nil)
+	options.MinBlockDuration = a.cfg.tsdbBlockLength.Milliseconds()
+	options.MaxBlockDuration = a.cfg.tsdbBlockLength.Milliseconds()
+
+	_ = level.Debug(a.logger).Log("msg", "opening TSDB", "path", a.cfg.tsdbPath, "block-duration", a.cfg.tsdbBlockLength.String(), "retention", a.cfg.tsdbRetention.String())
+
+	db, err := tsdb.Open(a.cfg.tsdbPath, &logLevelOverride{next: a.logger, level: level.DebugValue()}, a.reg, options, nil)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
 
-	var (
-		minTime, maxTime time.Time
-	)
-	if mT, init := db.Head().AppendableMinValidTime(); init {
-		minTime = timestamp.Time(mT)
-		maxTime = timestamp.Time(db.Head().MaxTime())
-		_ = level.Debug(a.logger).Log("msg", "opened TSDB",
-			"min_time", minTime,
-			"max_time", maxTime,
-		)
-	}
-
-	var twCookies []*http.Cookie
-
-	if err := retry.Do(
-		func() error {
-			ctx, cancel := context.WithTimeout(ctx, a.cfg.thamesWaterLoginTimeout)
-			defer cancel()
-
-			var err error
-			twCookies, err = a.getLoginCookies(ctx)
-
-			return err
-		},
-		retry.Context(ctx),
-		retry.OnRetry(func(n uint, err error) {
-			_ = a.logger.Log("msg", "login failed", "err", err, "try", n+1)
-		}),
-	); err != nil {
-		return err
-	}
-
-	twClient, err := api.New(twCookies)
+	gClient, err := api.New(a.logger, a.cfg.glowmarktEmail, a.cfg.glowmarktPassword)
 	if err != nil {
 		return err
 	}
 
-	resp, err := twClient.GetMeters(ctx)
+	apiResources, err := gClient.GetResources(ctx)
 	if err != nil {
 		return err
 	}
 
-	if len(resp.Meters) == 0 {
-		return fmt.Errorf("no meters found")
+	if len(apiResources) == 0 {
+		return fmt.Errorf("no resources found")
 	}
 
-	_ = level.Info(a.logger).Log("msg", "found meters", "meters", strings.Join(resp.Meters, ", "))
+	var resources []*resource
 
-	meter := resp.Meters[0]
-
-	var readingRequests = make([]api.GetSmartWaterMeterConsumptionsRequest, len(resp.Daily))
-	for pos := range resp.Daily {
-		readingRequests[pos].Meter = meter
-
-		ts, err := time.Parse("02-01-2006", resp.Daily[pos].Value)
-		if err != nil {
-			return err
-		}
-		readingRequests[pos].StartDate = ts
-		readingRequests[pos].EndDate = ts
+	// create querier
+	querier, err := db.Querier(ctx, 0, math.MaxInt64)
+	if err != nil {
+		return err
 	}
-	sort.Slice(readingRequests, func(i, j int) bool {
-		return readingRequests[i].StartDate.Before(readingRequests[j].StartDate)
-	})
 
-	// prepare labels
-	lbls := labels.NewBuilder(a.cfg.externalLabels())
-	lbls.Set("job", "thames-water-importer")
-	lbls.Set(labels.MetricName, "water_consumption_liters")
-
-	for _, reqData := range readingRequests {
-		if !minTime.Before(reqData.StartDate) {
-			_ = level.Debug(a.logger).Log("msg", "skipped daily reading, as TSDB already contains data", "meter", reqData.Meter, "date", reqData.StartDate.Format("2006-01-02"))
+	for _, resource := range apiResources {
+		if resource.DataSourceResourceTypeInfo.Unit != "kWh" {
+			_ = level.Debug(a.logger).Log("msg", "skip resource because of unknown unit", "id", resource.ResourceID, "unit", resource.DataSourceResourceTypeInfo.Unit, "type", resource.DataSourceResourceTypeInfo.Type)
 			continue
 		}
-		_ = level.Debug(a.logger).Log("msg", "daily reading", "meter", reqData.Meter, "date", reqData.StartDate.Format("2006-01-02"))
+		_ = level.Info(a.logger).Log("msg", "found resource", "id", resource.ResourceID, "unit", resource.DataSourceResourceTypeInfo.Unit, "type", resource.DataSourceResourceTypeInfo.Type)
 
-		resp, err := twClient.GetSmartWaterMeterConsumptions(ctx, reqData)
+		if err := gClient.CatchupResource(ctx, resource.ResourceID); err != nil {
+			return err
+		}
+
+		r, err := a.newResource(ctx, gClient, resource, querier)
 		if err != nil {
 			return err
+		}
+		resources = append(resources, r)
+	}
+
+	if err := querier.Close(); err != nil {
+		return err
+	}
+
+	var (
+		// minimum time that resources are at
+		minTime time.Time
+
+		// are all resources finished
+		finished bool
+	)
+
+	for {
+
+		// reset vars
+		finished = true
+		minTime = time.Time{}
+
+		for _, res := range resources {
+			if res.finished {
+				continue
+			}
+			finished = false
+			if minTime.IsZero() || res.at().Before(minTime) {
+				minTime = res.at()
+			}
+		}
+
+		if finished {
+			break
 		}
 
 		// get new appender to TSDB
 		a := db.Appender(ctx)
 
-		for pos := range resp.Lines {
-			timeParts := strings.Split(resp.Lines[pos].Label, ":")
-			if len(timeParts) != 2 {
-				return fmt.Errorf("unexpected label split count: %d", len(timeParts))
+		// append matching minimum and next
+		for _, res := range resources {
+			if res.finished {
+				continue
 			}
-			hours, err := strconv.ParseInt(timeParts[0], 10, 32)
-			if err != nil {
-				return err
-			}
-			minutes, err := strconv.ParseInt(timeParts[1], 10, 32)
-			if err != nil {
-				return err
-			}
-
-			ts := time.Date(
-				reqData.StartDate.Year(),
-				reqData.StartDate.Month(),
-				reqData.StartDate.Day(),
-				int(hours),
-				int(minutes),
-				0,
-				0,
-				time.UTC,
-			)
-			lbls.Set("meter", resp.Lines[pos].MeterSerialNumberHis)
-			if _, err := a.Append(
-				0,
-				lbls.Labels(),
-				timestamp.FromTime(ts),
-				resp.Lines[pos].Read,
-			); err != nil {
-				return err
+			if res.at().Equal(minTime) {
+				if err := res.append(ctx, a); err != nil {
+					return err
+				}
 			}
 		}
 
@@ -387,31 +409,7 @@ func (a *App) importConsumptionIntoLocalTSDB(ctx context.Context) error {
 		}
 	}
 
-	return nil
-}
-
-func loginThamesWater(email, password string, accountNumber, accountAddress *string) chromedp.Tasks {
-	return chromedp.Tasks{
-		// open url
-		chromedp.Navigate(loginURL),
-
-		// enter email
-		chromedp.WaitReady(`button#btnNext`),
-		chromedp.SendKeys(`//input[@type="email" and @name="email"]`, email),
-		chromedp.Click(`button#btnNext`, chromedp.NodeVisible),
-
-		// enter password
-		chromedp.WaitVisible(`//input[@type="password" and @name="Password"]`),
-		chromedp.SendKeys(`//input[@type="password" and @name="Password"]`, password),
-		chromedp.Click(`button#next`, chromedp.NodeVisible),
-
-		// wait for account details to be shown (otherwise cookie is not authorized)
-		chromedp.WaitReady(`div.details-panel`),
-
-		// extract account number / address
-		chromedp.Text(`div.details-panel span.detail-value.txt-actnumber`, accountNumber),
-		chromedp.Text(`div.details-panel span.detail-value.txt-adr`, accountAddress),
-	}
+	return db.Compact()
 }
 
 func (a *App) Run(ctx context.Context) error {

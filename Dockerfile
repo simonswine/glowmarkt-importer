@@ -11,14 +11,14 @@ COPY ./main.go ./
 COPY ./api ./api
 COPY ./app ./app
 
-RUN CGO_ENABLED=0 GOOS=linux go build -o thames-water-importer ./
+RUN CGO_ENABLED=0 GOOS=linux go build -o glowmarkt-importer ./
 
-FROM browserless/chrome:1.50-chrome-stable
+FROM alpine:3.14
 
 WORKDIR /tmp
 
-COPY --from=0 /workspace/thames-water-importer /usr/bin
+COPY --from=0 /workspace/glowmarkt-importer /usr/bin
 
-USER blessuser
+USER nobody
 
-ENTRYPOINT ["thames-water-importer"]
+ENTRYPOINT ["glowmarkt-importer"]
