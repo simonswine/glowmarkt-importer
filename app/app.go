@@ -364,29 +364,20 @@ func (a *App) importConsumptionIntoLocalTSDB(ctx context.Context) error {
 	var (
 		// minimum time that resources are at
 		minTime time.Time
-
-		// are all resources finished
-		finished bool
 	)
 
+appending:
 	for {
-
 		// reset vars
-		finished = true
 		minTime = time.Time{}
 
 		for _, res := range resources {
 			if res.finished {
-				continue
+				break appending
 			}
-			finished = false
 			if minTime.IsZero() || res.at().Before(minTime) {
 				minTime = res.at()
 			}
-		}
-
-		if finished {
-			break
 		}
 
 		// get new appender to TSDB
@@ -394,9 +385,6 @@ func (a *App) importConsumptionIntoLocalTSDB(ctx context.Context) error {
 
 		// append matching minimum and next
 		for _, res := range resources {
-			if res.finished {
-				continue
-			}
 			if res.at().Equal(minTime) {
 				if err := res.append(ctx, a); err != nil {
 					return err
