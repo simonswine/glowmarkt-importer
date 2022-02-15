@@ -1,4 +1,4 @@
-FROM golang:1.17.4
+FROM golang:1.17.7
 
 WORKDIR /workspace
 
@@ -13,7 +13,7 @@ COPY ./app ./app
 
 RUN CGO_ENABLED=0 GOOS=linux go build -o glowmarkt-importer ./
 
-FROM alpine:3.14
+FROM alpine:3.15.0
 
 WORKDIR /tmp
 
