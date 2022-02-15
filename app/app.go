@@ -299,36 +299,28 @@ func (r *resource) next(ctx context.Context) error {
 	return nil
 }
 
-func (a *App) importConsumptionIntoLocalTSDB(ctx context.Context) error {
+func (a *App) initDB(ctx context.Context) (*tsdb.DB, error) {
 	// open tsdb
 	options := tsdb.DefaultOptions()
 	options.RetentionDuration = a.cfg.tsdbRetention.Milliseconds()
 
 	// set retention
-
 	options.MinBlockDuration = a.cfg.tsdbBlockLength.Milliseconds()
 	options.MaxBlockDuration = a.cfg.tsdbBlockLength.Milliseconds()
 
 	_ = level.Debug(a.logger).Log("msg", "opening TSDB", "path", a.cfg.tsdbPath, "block-duration", a.cfg.tsdbBlockLength.String(), "retention", a.cfg.tsdbRetention.String())
 
-	db, err := tsdb.Open(a.cfg.tsdbPath, &logLevelOverride{next: a.logger, level: level.DebugValue()}, a.reg, options, nil)
-	if err != nil {
-		return err
-	}
-	defer db.Close()
+	return tsdb.Open(a.cfg.tsdbPath, &logLevelOverride{next: a.logger, level: level.DebugValue()}, a.reg, options, nil)
+}
 
-	gClient, err := api.New(a.logger, a.cfg.glowmarktEmail, a.cfg.glowmarktPassword)
-	if err != nil {
-		return err
-	}
-
+func (a *App) initResources(ctx context.Context, db *tsdb.DB, gClient *api.Client) ([]*resource, error) {
 	apiResources, err := gClient.GetResources(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	if len(apiResources) == 0 {
-		return fmt.Errorf("no resources found")
+		return nil, fmt.Errorf("no resources found")
 	}
 
 	var resources []*resource
@@ -336,7 +328,7 @@ func (a *App) importConsumptionIntoLocalTSDB(ctx context.Context) error {
 	// create querier
 	querier, err := db.Querier(ctx, 0, math.MaxInt64)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	for _, resource := range apiResources {
@@ -347,19 +339,24 @@ func (a *App) importConsumptionIntoLocalTSDB(ctx context.Context) error {
 		_ = level.Info(a.logger).Log("msg", "found resource", "id", resource.ResourceID, "unit", resource.DataSourceResourceTypeInfo.Unit, "type", resource.DataSourceResourceTypeInfo.Type)
 
 		if err := gClient.CatchupResource(ctx, resource.ResourceID); err != nil {
-			return err
+			return nil, err
 		}
 
 		r, err := a.newResource(ctx, gClient, resource, querier)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		resources = append(resources, r)
 	}
 
 	if err := querier.Close(); err != nil {
-		return err
+		return nil, err
 	}
+
+	return resources, nil
+}
+
+func (a *App) importConsumptionIntoLocalTSDB(ctx context.Context, db *tsdb.DB, resources []*resource) error {
 
 	var (
 		// minimum time that resources are at
@@ -401,12 +398,62 @@ appending:
 }
 
 func (a *App) Run(ctx context.Context) error {
-	if err := a.importConsumptionIntoLocalTSDB(ctx); err != nil {
+	db, err := a.initDB(ctx)
+	if err != nil {
+		return err
+	}
+	defer runutil.CloseWithLogOnErr(a.logger, db, "TSDB")
+
+	gClient, err := api.New(a.logger, a.cfg.glowmarktEmail, a.cfg.glowmarktPassword)
+	if err != nil {
 		return err
 	}
 
-	if err := a.uploadLocalTSDB(ctx); err != nil {
+	resources, err := a.initResources(ctx, db, gClient)
+	if err != nil {
 		return err
+	}
+
+	// ensure glowmarkt renews the consumption data every hour
+	refreshTicker := time.NewTicker(time.Hour)
+
+	// request an immedate update of the local data at first
+	updateTimer := time.NewTimer(0)
+
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-refreshTicker.C:
+				_ = level.Info(a.logger).Log("msg", "catch up all glowmarket resources")
+
+				for _, r := range resources {
+					if err := gClient.CatchupResource(ctx, r.id); err != nil {
+						_ = level.Warn(a.logger).Log("msg", "error requestion ressource catch up", "err", err)
+					}
+				}
+
+				updateTimer.Reset(5 * time.Minute)
+			}
+		}
+	}()
+
+run:
+	for {
+		select {
+		case <-ctx.Done():
+			break run
+		case <-updateTimer.C:
+			_ = level.Info(a.logger).Log("msg", "update local tsdb")
+			if err := a.importConsumptionIntoLocalTSDB(ctx, db, resources); err != nil {
+				return err
+			}
+
+			if err := a.uploadLocalTSDB(ctx); err != nil {
+				return err
+			}
+		}
 	}
 
 	return nil
